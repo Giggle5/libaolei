@@ -1,3 +1,7 @@
+连接github
 https://blog.csdn.net/2301_79535618/article/details/136769846
-
 https://blog.csdn.net/2301_80716318/article/details/142899654
+
+pyharm连接github失败解决方法
+
+https://blog.csdn.net/skvjw/article/details/141822567
