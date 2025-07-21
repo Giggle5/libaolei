@@ -568,6 +568,194 @@ enumerate返回(索引, 数据)元组
 需要数据增强的实验
 
 ## model.py
+
+我们逐步解释这个YOLOv1模型的代码。这个模型基于ResNet34作为特征提取器，然后添加了额外的卷积层和全连接层来预测边界框和类别。
+### 代码解释：
+```python
+import torch
+import torch.nn as nn
+import torchvision.models as tvmodel
+from prepare_data import GL_CLASSES, GL_NUMBBOX, GL_NUMGRID
+from util import calculate_iou
+```
+- 导入必要的库：`torch`, `nn`（神经网络模块），`torchvision.models`（预训练模型）。
+- 从`prepare_data`模块导入全局变量：`GL_CLASSES`（类别数量），`GL_NUMBBOX`（每个网格预测的边界框数量，YOLOv1为2），`GL_NUMGRID`（网格数量，原始YOLOv1为7x7）。
+- 从`util`导入`calculate_iou`函数（用于计算两个边界框的IoU）。
+```python
+class MyNet(nn.Module):
+    """
+    @ 网络实际名称
+    为了和后续接口对齐，此处类名固定为MyNet，具体是什么网络可以写在注释里。
+    """
+    def __init__(self):
+        super(MyNet, self).__init__()
+        resnet = tvmodel.resnet34(pretrained=None)  # 调用torchvision里的resnet34预训练模型
+        resnet_out_channel = resnet.fc.in_features  # 记录resnet全连接层之前的网络输出通道数，方便连入后续卷积网络中
+        self.resnet = nn.Sequential(*list(resnet.children())[:-2])  # 去除resnet的最后两层
+```
+- 定义`MyNet`类，继承自`nn.Module`。
+- 在`__init__`中：
+  - 加载ResNet34模型（不使用预训练权重）。
+  - 获取全连接层之前的特征维度（`resnet.fc.in_features`），对于ResNet34，这个值是512。
+  - 将ResNet34除了最后两层（平均池化层和全连接层）以外的层作为特征提取器，这样输出的特征图尺寸为原图的1/32（例如，输入448x448，输出14x14，通道数为512）。
+```python
+        # 以下是YOLOv1的最后四个卷积层
+        self.Conv_layers = nn.Sequential(
+            nn.Conv2d(resnet_out_channel, 1024, 3, padding=1),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(1024, 1024, 3, stride=2, padding=1),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(1024, 1024, 3, padding=1),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(1024, 1024, 3, padding=1),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(inplace=True),
+        )
+```
+- 添加四个卷积层（YOLOv1的后四个卷积层）：
+  - 第一个卷积层：输入通道数为512（来自ResNet），输出1024，3x3卷积，padding=1（保持尺寸）。
+  - 第二个卷积层：1024通道，3x3卷积，步长2（下采样），padding=1（输出尺寸减半）。
+  - 第三、四个卷积层：1024通道，3x3卷积，padding=1（保持尺寸）。
+  - 每个卷积层后接批归一化（BN）和LeakyReLU激活。
+```python
+        # 以下是YOLOv1的最后2个全连接层
+        self.Conn_layers = nn.Sequential(
+            nn.Linear(GL_NUMGRID * GL_NUMGRID * 1024, 4096),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(4096, GL_NUMGRID * GL_NUMGRID * (5*GL_NUMBBOX+len(GL_CLASSES))),
+            nn.Sigmoid()  # 增加sigmoid函数是为了将输出全部映射到(0,1)之间
+        )
+```
+- 两个全连接层：
+  - 第一个全连接层：将卷积层输出的特征图展平（7x7x1024=50176）并连接到4096个神经元。
+  - 第二个全连接层：4096个神经元连接到输出（7x7x(5*2+类别数)）。因为每个网格预测2个边界框（每个框有5个值：x,y,w,h,confidence）和类别概率（类别数）。
+  - 使用Sigmoid将输出映射到(0,1)之间（注意：原始YOLOv1没有这个，这里是为了方便处理）。
+```python
+    def forward(self, inputs):
+        x = self.resnet(inputs)
+        x = self.Conv_layers(x) #使用resnet的输出14x14x512，经过卷积层后变为7x7x1024
+        x = x.view(x.size()[0], -1)  #对7x7x1024进行展平处理
+        x = self.Conn_layers(x) #全连接线性分类器得到1x(7*7*(5*2+类别数))
+        self.pred = x.reshape(-1, (5 * GL_NUMBBOX + len(GL_CLASSES)), GL_NUMGRID, GL_NUMGRID)  # 重塑为(batch, 30, 7, 7)
+        return self.pred
+```
+- 前向传播：
+  - 输入图像通过ResNet部分（输出14x14x512）。
+  - 通过四个卷积层（输出7x7x1024）。
+  - 展平特征图（变为batch_size x (7*7*1024)）。
+  - 通过两个全连接层（输出batch_size x (7*7*30)）。
+  - 重塑为(batch_size, 30, 7, 7)并返回（30=5*2+20，假设20个类别）。
+```python
+    def calculate_loss(self, labels):
+        self.pred = self.pred.double()
+        labels = labels.double()
+        num_gridx, num_gridy = GL_NUMGRID, GL_NUMGRID  # 划分网格数量
+        noobj_confi_loss = 0.  # 不含目标的网格损失(只有置信度损失)
+        coor_loss = 0.  # 含有目标的bbox的坐标损失
+        obj_confi_loss = 0.  # 含有目标的bbox的置信度损失
+        class_loss = 0.  # 含有目标的网格的类别损失
+        n_batch = labels.size()[0]  # batchsize的大小
+```
+- 计算损失函数：
+  - 将预测值和标签转为double类型。
+  - 初始化各种损失分量：无目标置信度损失、坐标损失、有目标置信度损失、类别损失。
+  - 获取batch大小。
+```python
+        for i in range(n_batch):  # batchsize循环
+            for n in range(num_gridx):  # x方向网格循环
+                for m in range(num_gridy):  # y方向网格循环
+                    if labels[i, 4, m, n] == 1:  # 如果包含物体
+                        # 将数据(px,py,w,h)转换为(x1,y1,x2,y2)
+                        # 转换预测的第一个边界框
+                        bbox1_pred_xyxy = (...)
+                        # 转换预测的第二个边界框
+                        bbox2_pred_xyxy = (...)
+                        # 转换真实边界框
+                        bbox_gt_xyxy = (...)
+                        # 计算两个预测框与真实框的IoU
+                        iou1 = calculate_iou(bbox1_pred_xyxy, bbox_gt_xyxy)
+                        iou2 = calculate_iou(bbox2_pred_xyxy, bbox_gt_xyxy)
+                        # 选择iou大的bbox作为负责物体
+                        if iou1 >= iou2:
+                            # 计算坐标损失（只针对负责的边界框）
+                            coor_loss += ... 
+                            # 负责边界框的置信度损失（目标是IoU）
+                            obj_confi_loss += ...
+                            # 另一个边界框的置信度损失（目标为0？注意这里的目标是另一个框的IoU？）
+                            noobj_confi_loss += ...
+                        else:
+                            # 类似，但负责的是第二个边界框
+                            ...
+                        # 类别损失（不管哪个边界框负责，每个网格只算一次类别损失）
+                        class_loss += ...
+                    else:  # 如果不包含物体
+                        # 两个边界框的置信度都应该是0，所以计算它们的平方和
+                        noobj_confi_loss += ...
+        # 总损失
+        loss = coor_loss + obj_confi_loss + noobj_confi_loss + class_loss
+        return loss / n_batch
+```
+- 损失计算细节：
+  - 遍历每个样本，每个网格（7x7）。
+  - 如果网格包含物体（标签中第4个通道为1），则：
+    - 将预测的两个边界框和真实边界框从(中心x, 中心y, 宽, 高)转换为(x1,y1,x2,y2)格式。
+    - 计算两个预测框与真实框的IoU。
+    - 选择IoU较大的边界框作为负责预测物体的框：
+      - 计算该框的坐标损失（中心点误差和宽高的平方根误差，乘以权重5）。
+      - 该框的置信度损失（目标是其IoU值）。
+      - 另一个框的置信度损失（目标为另一个框的IoU值，乘以0.5的权重）。
+    - 计算类别损失（预测类别和真实类别的平方差）。
+  - 如果网格不包含物体，则两个边界框的置信度损失（目标是0，乘以0.5的权重）。
+  - 总损失为所有损失分量之和，然后除以batch_size（平均损失）。
+```python
+    def calculate_metric(self, preds, labels):
+        preds = preds.double()
+        labels = labels[:, :(self.n_points*2)]
+        l2_distance = torch.mean(torch.sum((preds-labels)**2, dim=1))
+        return l2_distance
+```
+- 计算评估指标（这里可能是用于关键点检测的L2距离，但在YOLO中通常使用mAP等。这个函数似乎与前面的YOLO任务不匹配，可能是遗留代码？）。
+```python
+if __name__ == '__main__':
+    # 自定义输入张量，验证网络可以正常跑通，并计算loss，调试用
+    x = torch.zeros(5,3,448,448)
+    net = MyNet()
+    a = net(x)
+    labels = torch.zeros(5, 30, 7, 7)
+    loss = net.calculate_loss(labels)
+    print(loss)
+    print(a.shape)
+```
+- 测试代码：创建网络，输入5张448x448的黑色图像，计算输出和损失（标签也是全0），打印损失和输出形状。
+### 注意：
+- 在损失计算中，对于包含物体的网格，类别损失只计算一次（与哪个边界框负责无关）。
+- 坐标损失只计算负责的边界框（即与真实框IoU较大的那个框）。
+- 置信度损失分为两部分：负责框（目标是IoU）和不负责框（目标是0或另一个IoU？代码中对于不负责的框，其目标为另一个IoU，但乘以0.5的权重）。然而，在原始YOLOv1中，不负责的框的置信度目标就是0。这里代码的处理方式与原始论文略有不同。
+### 原始YOLOv1损失函数回顾：
+- 坐标损失：只对负责预测物体的边界框（即与真实框IoU最大的那个）计算。
+- 置信度损失：负责预测物体的边界框的目标是1（或IoU），不负责的目标是0。
+- 类别损失：每个网格只计算一次（与边界框无关），目标是该网格的类别概率。
+因此，上述代码中对于不负责的边界框的置信度损失，目标值设置为另一个边界框的IoU（而不是0），这可能是作者的一种尝试，但不符合原始论文。不过，在原始论文中，不负责的框的置信度目标就是0。
+### 改进建议：
+- 对于不包含物体的网格，两个边界框的置信度目标都是0。
+- 对于包含物体的网格，负责的边界框置信度目标为1（或者IoU，但原始论文是1），不负责的边界框置信度目标为0。
+因此，在代码中，对于包含物体的网格，不负责的边界框的置信度损失应该以0为目标，而不是另一个IoU。可以修改为：
+```python
+# 代替原来计算noobj_confi_loss的部分
+if iou1 >= iou2:
+    ... # 负责框1
+    # 不负责的框（框2）的置信度目标为0
+    noobj_confi_loss = noobj_confi_loss + 0.5 * (self.pred[i, 9, m, n] - 0) ** 2
+else:
+    ... # 负责框2
+    noobj_confi_loss = noobj_confi_loss + 0.5 * (self.pred[i, 4, m, n] - 0) ** 2
+```
+这样修改后，更符合原始论文的损失函数设计。
+下面是对代码的逐行详细解释：
+
 python
 import torch
 import torch.nn as nn
@@ -814,7 +1002,3 @@ YOLOv1损失函数关键点：
 使用双精度计算确保数值稳定性
 
 这个实现结合了ResNet34的特征提取能力和YOLOv1的检测头，同时添加了批归一化来改善训练稳定性。
-
-
-
-
